@@ -1,0 +1,179 @@
+services:
+  haproxy:
+    image: haproxy:2.9
+    restart: always
+    ports:
+      - "80:80"
+      - "8888:8888"
+    environment:
+      HAPROXY_STATS_USER: admin
+      HAPROXY_STATS_PASS: your_secure_password
+    depends_on:
+      - nginx
+      - apache
+    command: >
+      sh -c 'cat > /usr/local/etc/haproxy/haproxy.cfg <<EOF
+      global
+        log stdout format raw local0
+      defaults
+        log     global
+        mode    http
+        timeout connect 5s
+        timeout client  50s
+        timeout server  50s
+
+      frontend http_in
+        bind *:80
+        acl url_static path_beg /static/
+        use_backend static_backend if url_static
+        default_backend dynamic_backend
+
+      backend static_backend
+        balance roundrobin
+        server nginx nginx:80 check
+        server apache apache:80 check
+
+      backend dynamic_backend
+        balance roundrobin
+        server nginx nginx:80 check
+        server apache apache:80 check
+
+      listen stats
+        bind *:8888
+        stats enable
+        stats uri /stats
+        stats refresh 10s
+        stats auth ${HAPROXY_STATS_USER}:${HAPROXY_STATS_PASS}
+      EOF
+      && exec haproxy -W -db -f /usr/local/etc/haproxy/haproxy.cfg'
+
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: nginx
+    restart: always
+    ports:
+      - "8000:80"
+    volumes:
+      - static_volume:/app/staticfiles:ro
+    depends_on:
+      - app
+    command: >
+      sh -c 'cat > /etc/nginx/conf.d/default.conf <<'\''EOF'\''
+      server {
+        listen 80;
+
+        location /static/ {
+          alias /app/staticfiles/;
+          access_log off;
+          expires 1h;
+        }
+
+        location / {
+          proxy_pass http://app:8000;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+        }
+      }
+      EOF
+      && exec nginx -g "daemon off;"'
+
+  apache:
+    image: httpd:2.4
+    container_name: apache
+    restart: always
+    ports:
+      - "8001:80"
+    volumes:
+      - static_volume:/usr/local/apache2/htdocs:ro
+    depends_on:
+      - app
+    command: >
+      sh -c 'set -eu;
+      CONF=/usr/local/apache2/conf/httpd.conf;
+      grep -qF "mod_proxy.so" "$CONF" || echo "LoadModule proxy_module modules/mod_proxy.so" >> "$CONF";
+      grep -qF "mod_proxy_http.so" "$CONF" || echo "LoadModule proxy_http_module modules/mod_proxy_http.so" >> "$CONF";
+      grep -qF "mod_alias.so" "$CONF" || echo "LoadModule alias_module modules/mod_alias.so" >> "$CONF";
+      grep -qF "mod_rewrite.so" "$CONF" || echo "LoadModule rewrite_module modules/mod_rewrite.so" >> "$CONF";
+      grep -qF "ServerName" "$CONF" || echo "ServerName localhost" >> "$CONF";
+      cat >> "$CONF" <<\'EOF\'
+      <VirtualHost *:80>
+        Alias /static/ "/usr/local/apache2/htdocs/"
+        ProxyPass /static/ !
+        ProxyPass / http://app:8000/
+        ProxyPassReverse / http://app:8000/
+        <Directory "/usr/local/apache2/htdocs">
+          Require all granted
+          DirectoryIndex disabled
+        </Directory>
+      </VirtualHost>
+      EOF
+      exec httpd-foreground'
+
+  app:
+    image: python:3.12-slim
+    container_name: app
+    restart: always
+    working_dir: /app
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      DB_HOST: db
+      DB_NAME: my_project_db
+      DB_USER: my_db_user
+      DB_PASSWORD: my_db_password
+      DJANGO_DEBUG: "0"
+      DJANGO_SECRET_KEY: replace_me_with_a_secure_value
+      PIP_REQUIREMENTS: |
+        Django==4.2.7
+        asgiref==3.7.2
+        sqlparse==0.4.4
+        mysqlclient==2.2.4
+        pkgconfig==1.5.5
+        gunicorn
+      GUNICORN_WORKERS: "3"
+      GUNICORN_THREADS: "2"
+      GUNICORN_TIMEOUT: "60"
+    volumes:
+      - ./:/app
+      - static_volume:/app/staticfiles
+    expose:
+      - "8000"
+    depends_on:
+      - db
+    command: >
+      sh -c 'set -eux;
+      apt-get update;
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        default-libmysqlclient-dev build-essential pkg-config;
+      rm -rf /var/lib/apt/lists/*;
+      python -m pip install --no-cache-dir --upgrade pip;
+      printf "%s" "$PIP_REQUIREMENTS" > /tmp/requirements.txt;
+      pip install --no-cache-dir -r /tmp/requirements.txt;
+      python manage.py migrate --noinput;
+      python manage.py collectstatic --no-input;
+      exec gunicorn community_board_project.wsgi:application \
+        --bind 0.0.0.0:8000 \
+        --workers ${GUNICORN_WORKERS:-3} \
+        --threads ${GUNICORN_THREADS:-2} \
+        --timeout ${GUNICORN_TIMEOUT:-60}'
+
+  db:
+    image: mysql:8.0
+    container_name: db
+    restart: always
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_DATABASE: my_project_db
+      MYSQL_USER: my_db_user
+      MYSQL_PASSWORD: my_db_password
+      MYSQL_ROOT_PASSWORD: my_root_password
+    volumes:
+      - db_data:/var/lib/mysql
+
+volumes:
+  static_volume:
+  db_data:
+
